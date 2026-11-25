@@ -1,4 +1,5 @@
 import base64
+import logging
 import time
 import asyncio
 import subprocess
@@ -11,6 +12,8 @@ from sqlalchemy.orm import selectinload
 
 from app.config import settings
 from app.db.models import Shot, Episode, Series, User, CreditLedger
+
+logger = logging.getLogger("uvicorn.error")
 
 try:
     import imageio_ffmpeg
@@ -235,7 +238,7 @@ class OmniVideoService:
                     "response_format": {
                         "type": "video",
                         "aspect_ratio": "9:16",
-                        "duration": 15,
+                        "duration": "15s",
                         "resolution": resolution,
                         "delivery": "uri",
                     },
@@ -249,8 +252,13 @@ class OmniVideoService:
                 if edit_instruction and shot.previous_interaction_id:
                     create_kwargs["previous_interaction_id"] = shot.previous_interaction_id
 
+                logger.info(
+                    f"[OmniVideo] Starting live {settings.OMNI_VIDEO_MODEL} render: "
+                    f"shot={shot.id}, pass={pass_number} ({resolution}), task={task_type}, anchors={len(reference_anchors)}"
+                )
                 resp = await asyncio.to_thread(client.interactions.create, **create_kwargs)
                 interaction_id = getattr(resp, "id", None)
+                logger.info(f"[OmniVideo] Created interaction {interaction_id} (status={getattr(resp, 'status', None)})")
 
                 # Poll until completed or failed
                 max_polls = 120  # up to ~6 minutes
@@ -283,11 +291,13 @@ class OmniVideoService:
                     vid_uri = getattr(out_vid, "uri", None)
                     vid_data = getattr(out_vid, "data", None)
                     if vid_uri:
-                        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as hclient:
+                        logger.info(f"[OmniVideo] Downloading rendered MP4 from URI for shot={shot.id}...")
+                        async with httpx.AsyncClient(timeout=180.0, follow_redirects=True) as hclient:
                             r = await hclient.get(vid_uri, headers={"x-goog-api-key": api_key})
                             r.raise_for_status()
                             output_file.write_bytes(r.content)
                             downloaded = True
+                            logger.info(f"[OmniVideo] Downloaded {len(r.content)} bytes to {output_file.name}")
                     elif vid_data:
                         raw_bytes = base64.b64decode(vid_data) if isinstance(vid_data, str) else vid_data
                         output_file.write_bytes(raw_bytes)
@@ -298,8 +308,9 @@ class OmniVideoService:
 
             except Exception as api_err:
                 err_str = str(api_err)
+                logger.error(f"[OmniVideo] Live API error on shot {shot.id}: {err_str}")
+                setattr(shot, pass_field_status, "failed")
                 if _is_safety_rejection(err_str):
-                    setattr(shot, pass_field_status, "failed")
                     shot.last_error_message = f"Safety Policy Violation: {err_str}"
                     await db.commit()
                     return {
@@ -308,8 +319,10 @@ class OmniVideoService:
                         "can_reframe": True,
                         "shot_id": shot.id,
                     }
-                print(f"[OmniVideo] Live API notice ({err_str}), falling back to local mock render.")
-                use_mock = True
+                # Never silently charge credits for a mock placeholder in LIVE mode!
+                shot.last_error_message = f"Gemini Omni API Error: {err_str}"
+                await db.commit()
+                raise RuntimeError(shot.last_error_message)
 
         if use_mock:
             title_label = f"Shot {shot.shot_number}: {shot.beat_type}"

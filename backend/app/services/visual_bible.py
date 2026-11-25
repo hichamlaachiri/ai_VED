@@ -1,8 +1,12 @@
+import asyncio
 import io
+import logging
 import time
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 from PIL import Image as PILImage, ImageDraw
+
+logger = logging.getLogger("uvicorn.error")
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
@@ -84,18 +88,19 @@ async def generate_image_with_gemini(
     output_path: Path,
     reference_image_path: Optional[Path] = None,
     aspect_ratio: str = "9:16",
-) -> bool:
+) -> Tuple[bool, Optional[str]]:
     """
     Generates a 9:16 Visual Bible anchor via google-genai SDK:
     1. Primary: Nano Banana multimodal image generation (`gemini-2.5-flash-image`), supporting
        true image-to-image chaining when `reference_image_path` is provided.
     2. Secondary fallback: Imagen 3 (`imagen-3.0-generate-002`).
-    3. Graceful offline fallback handled by caller if API key is missing/invalid.
+    Returns (success, error_message_if_failed).
     """
     api_key = settings.GEMINI_API_KEY
     if not api_key or api_key == "your_gemini_api_key_here" or genai is None or settings.MOCK_VIDEO_MODE:
-        return False
+        return False, "API key missing or MOCK_VIDEO_MODE enabled"
 
+    last_err: Optional[str] = None
     try:
         client = genai.Client(api_key=api_key)
 
@@ -111,7 +116,8 @@ async def generate_image_with_gemini(
             if hasattr(types, "ImageConfig"):
                 cfg_kwargs["image_config"] = types.ImageConfig(aspect_ratio=aspect_ratio)
 
-            resp = client.models.generate_content(
+            resp = await asyncio.to_thread(
+                client.models.generate_content,
                 model=settings.NANO_BANANA_MODEL,
                 contents=contents,
                 config=types.GenerateContentConfig(**cfg_kwargs),
@@ -121,13 +127,17 @@ async def generate_image_with_gemini(
                     if getattr(part, "inline_data", None) and part.inline_data.data:
                         img = PILImage.open(io.BytesIO(part.inline_data.data)).convert("RGB")
                         img.save(output_path, "JPEG", quality=92)
-                        return True
+                        return True, None
+            last_err = f"Nano Banana returned no image parts (candidates={len(resp.candidates or [])})"
+            logger.warning(f"[VisualBible] {last_err}")
         except Exception as nb_err:
-            print(f"[VisualBible] Nano Banana ({settings.NANO_BANANA_MODEL}) notice: {nb_err}")
+            last_err = f"Nano Banana ({settings.NANO_BANANA_MODEL}) error: {nb_err}"
+            logger.warning(f"[VisualBible] {last_err}")
 
         # 2. Secondary: Imagen 3 fallback
         try:
-            result = client.models.generate_images(
+            result = await asyncio.to_thread(
+                client.models.generate_images,
                 model=settings.IMAGEN_FALLBACK_MODEL,
                 prompt=prompt,
                 config=dict(
@@ -140,14 +150,16 @@ async def generate_image_with_gemini(
                 img_bytes = result.generated_images[0].image.image_bytes
                 with open(output_path, "wb") as f:
                     f.write(img_bytes)
-                return True
+                return True, None
         except Exception as im_err:
-            print(f"[VisualBible] Imagen fallback notice: {im_err}")
+            last_err = f"{last_err} | Imagen fallback error: {im_err}"
+            logger.warning(f"[VisualBible] Imagen fallback notice: {im_err}")
 
     except Exception as exc:
-        print(f"[VisualBible] GenAI client error: {exc}")
+        last_err = f"GenAI client error: {exc}"
+        logger.warning(f"[VisualBible] {last_err}")
 
-    return False
+    return False, last_err
 
 
 class VisualBibleService:
@@ -171,7 +183,7 @@ class VisualBibleService:
             f"Hyper-detailed facial features, 8k, photorealistic, professional cinema still, no text."
         )
 
-        success = await generate_image_with_gemini(prompt, filepath)
+        success, _ = await generate_image_with_gemini(prompt, filepath)
         if not success:
             create_cinematic_fallback_card(
                 title=f"{character.name} - Portrait",
@@ -206,7 +218,7 @@ class VisualBibleService:
             f"Photorealistic cinema costume test still, no text."
         )
 
-        success = await generate_image_with_gemini(
+        success, _ = await generate_image_with_gemini(
             prompt=prompt,
             output_path=filepath,
             reference_image_path=portrait_path if portrait_path.exists() else None,
@@ -242,7 +254,7 @@ class VisualBibleService:
             f"Empty film set with zero people, high dynamic range, crisp architecture, cinema production still, no text."
         )
 
-        success = await generate_image_with_gemini(prompt, filepath)
+        success, _ = await generate_image_with_gemini(prompt, filepath)
         if not success:
             create_cinematic_fallback_card(
                 title=f"{location.name} - Angle A (Front)",
@@ -275,7 +287,7 @@ class VisualBibleService:
             f"Lighting: {series.locked_lighting}. Empty film set, zero people, no text."
         )
 
-        success = await generate_image_with_gemini(
+        success, _ = await generate_image_with_gemini(
             prompt=prompt,
             output_path=filepath,
             reference_image_path=angle_a_path if angle_a_path.exists() else None,
